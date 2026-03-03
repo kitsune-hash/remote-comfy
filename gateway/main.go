@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/gin-contrib/cors"
@@ -15,15 +16,13 @@ import (
 )
 
 func main() {
-	// Config
 	port := getEnv("PORT", "8080")
 	dbPath := getEnv("DB_PATH", "./data/remote-comfy.db")
+	comfyURL := getEnv("COMFY_URL", "")
 	jobTimeout := 20 * time.Minute
 
-	// Ensure data directory exists
 	os.MkdirAll("./data", 0755)
 
-	// Database
 	store, err := db.New(dbPath)
 	if err != nil {
 		log.Fatalf("Failed to init database: %v", err)
@@ -31,25 +30,31 @@ func main() {
 	defer store.Close()
 	log.Println("Database initialized")
 
-	// Relay manager
 	relayMgr := relay.NewManager()
-
-	// Handlers
 	wfHandler := handlers.NewWorkflowHandler(store, relayMgr)
 
-	// Router
+	var proxyHandler *handlers.ProxyHandler
+	if comfyURL != "" {
+		proxyHandler = handlers.NewProxyHandler(comfyURL)
+		log.Printf("ComfyUI proxy enabled: %s", comfyURL)
+	}
+
 	r := gin.Default()
 
-	// CORS
 	r.Use(cors.New(cors.Config{
 		AllowAllOrigins:  true,
-		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization"},
 		AllowWebSockets:  true,
 		MaxAge:           12 * time.Hour,
 	}))
 
-	// Routes
+	// WebSocket proxy
+	if proxyHandler != nil {
+		r.GET("/ws", proxyHandler.ProxyWS)
+	}
+
+	// Our custom API routes
 	api := r.Group("/api")
 	{
 		api.GET("/health", func(c *gin.Context) {
@@ -69,6 +74,22 @@ func main() {
 		}
 
 		api.GET("/worker/connect/:id", wfHandler.WorkerConnect)
+	}
+
+	// Catch-all: proxy everything else to ComfyUI
+	if proxyHandler != nil {
+		r.NoRoute(func(c *gin.Context) {
+			path := c.Request.URL.Path
+			if strings.HasPrefix(path, "/api/workflow") ||
+				strings.HasPrefix(path, "/api/worker") ||
+				path == "/api/health" {
+				c.JSON(404, gin.H{"error": "not found"})
+				return
+			}
+			log.Printf("[proxy] %s %s", c.Request.Method, path)
+			proxyHandler.ProxyHTTP(c)
+		})
+		log.Println("ComfyUI catch-all proxy enabled")
 	}
 
 	// Background: timeout checker
