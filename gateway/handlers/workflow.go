@@ -203,7 +203,7 @@ func enqueueToRunqy(jobID string, workflow interface{}) error {
 		return err
 	}
 
-	req, err := http.NewRequest("POST", runqyURL+"/api/v1/enqueue", bytes.NewReader(body))
+	req, err := http.NewRequest("POST", runqyURL+"/queue/add", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
