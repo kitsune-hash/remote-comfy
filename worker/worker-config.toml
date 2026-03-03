@@ -1,0 +1,22 @@
+# Runqy Worker Configuration for remote-comfy
+
+[worker]
+queue = "comfy"
+handler = "python3 /worker/handler.py"
+long_running = true
+concurrency = 1
+
+[server]
+# These are typically set via environment variables
+# url = "https://runqy.example.com"
+# api_key = "..."
+
+[vault]
+# Secrets to inject from Runqy vault
+secrets = [
+    "azure-blob-storage",  # AZURE_STORAGE_CONNECTION_STRING, AZURE_STORAGE_CONTAINER
+]
+
+[timeouts]
+job_timeout = "20m"
+graceful_shutdown = "30s"

@@ -1,0 +1,36 @@
+# Binaries
+gateway/remote-comfy-gateway
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Data
+data/
+*.db
+
+# Go
+vendor/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+.docker/
+
+# Env
+.env
+.env.local
