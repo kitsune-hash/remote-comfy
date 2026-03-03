@@ -81,6 +81,7 @@
 import { ref } from 'vue'
 
 const API_URL = import.meta.env.VITE_API_URL || ''
+const WS_URL = import.meta.env.VITE_WS_URL || 'wss://ubuntu.tailfcee90.ts.net/gateway'
 
 const prompt = ref('')
 const negativePrompt = ref('ugly, blurry, low quality')
@@ -162,7 +163,7 @@ async function generate() {
     progress.value.push(`Job created: ${job_id}`)
     
     // Connect to WebSocket for progress
-    const wsUrl = `${API_URL.replace('http', 'ws')}${stream_url}`
+    const wsUrl = `${WS_URL}${stream_url}`
     const ws = new WebSocket(wsUrl)
     
     ws.onmessage = (event) => {
