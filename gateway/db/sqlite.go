@@ -125,7 +125,7 @@ func (s *Store) FailJob(id, errMsg string) error {
 }
 
 func (s *Store) GetTimedOutJobs(timeout time.Duration) ([]string, error) {
-	cutoff := time.Now().Add(-timeout)
+	cutoff := time.Now().UTC().Add(-timeout)
 	rows, err := s.db.Query(
 		"SELECT id FROM jobs WHERE status IN ('pending', 'running') AND created_at < ?",
 		cutoff,
