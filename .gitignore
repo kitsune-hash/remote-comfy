@@ -34,3 +34,5 @@ Thumbs.db
 # Env
 .env
 .env.local
+shell/node_modules/
+shell/dist/
