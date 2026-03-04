@@ -2,9 +2,12 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
+	"io"
 	"strings"
 	"log"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -366,4 +369,106 @@ func (h *ComfyInterceptHandler) HandleView(c *gin.Context) {
 	}
 	// Not found in Azure — will fall through to proxy via next handler
 	c.Set("fallthrough", true)
+}
+
+// HandleStatus returns gateway status including worker health from Runqy server.
+func (h *ComfyInterceptHandler) HandleStatus(c *gin.Context) {
+	runqyURL := os.Getenv("RUNQY_URL")
+	if runqyURL == "" {
+		runqyURL = "http://localhost:3000"
+	}
+	runqyAPIKey := os.Getenv("RUNQY_API_KEY")
+
+	// Fetch workers from Runqy
+	type RunqyWorker struct {
+		WorkerID    string `json:"worker_id"`
+		StartedAt   int64  `json:"started_at"`
+		LastBeat    int64  `json:"last_beat"`
+		Concurrency int    `json:"concurrency"`
+		Status      string `json:"status"`
+		IsStale     bool   `json:"is_stale"`
+	}
+	type RunqyWorkersResp struct {
+		Workers []RunqyWorker `json:"workers"`
+		Count   int           `json:"count"`
+	}
+
+	var workersResp RunqyWorkersResp
+	workersOK := false
+
+	req, err := http.NewRequest("GET", runqyURL+"/workers", nil)
+	if err == nil {
+		if runqyAPIKey != "" {
+			req.Header.Set("Authorization", "Bearer "+runqyAPIKey)
+		}
+		client := &http.Client{Timeout: 5 * time.Second}
+		resp, err := client.Do(req)
+		if err == nil {
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(resp.Body)
+			if json.Unmarshal(body, &workersResp) == nil {
+				workersOK = true
+			}
+		}
+	}
+
+	// Count active workers
+	activeWorkers := 0
+	totalCapacity := 0
+	var workerList []gin.H
+	if workersOK {
+		for _, w := range workersResp.Workers {
+			if w.Status == "running" && !w.IsStale {
+				activeWorkers++
+				totalCapacity += w.Concurrency
+				lastBeatAgo := time.Since(time.Unix(w.LastBeat, 0)).Round(time.Second)
+				workerList = append(workerList, gin.H{
+					"id":            w.WorkerID,
+					"status":        w.Status,
+					"concurrency":   w.Concurrency,
+					"last_heartbeat": fmt.Sprintf("%s ago", lastBeatAgo),
+					"uptime":        fmt.Sprintf("%s", time.Since(time.Unix(w.StartedAt, 0)).Round(time.Second)),
+				})
+			}
+		}
+	}
+
+	// Count jobs from DB
+	h.mu.RLock()
+	activeJobs := len(h.jobToClient)
+	connectedClients := len(h.clientConns)
+	cachedImages := len(h.imageURLs)
+	h.mu.RUnlock()
+
+	// Get job stats from DB
+	var pendingJobs, runningJobs, completedJobs, failedJobs int
+	if stats, err := h.store.GetJobStats(); err == nil {
+		pendingJobs = stats.Pending
+		runningJobs = stats.Running
+		completedJobs = stats.Completed
+		failedJobs = stats.Failed
+	}
+
+	c.JSON(200, gin.H{
+		"status":  "ok",
+		"service": "remote-comfy-gateway",
+		"version": "0.3.0",
+		"workers": gin.H{
+			"active":   activeWorkers,
+			"capacity": totalCapacity,
+			"list":     workerList,
+		},
+		"jobs": gin.H{
+			"active_relays": activeJobs,
+			"pending":       pendingJobs,
+			"running":       runningJobs,
+			"completed":     completedJobs,
+			"failed":        failedJobs,
+		},
+		"connections": gin.H{
+			"websocket_clients": connectedClients,
+			"cached_images":     cachedImages,
+		},
+		"runqy_server": workersOK,
+	})
 }

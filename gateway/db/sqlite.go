@@ -147,3 +147,39 @@ func (s *Store) GetTimedOutJobs(timeout time.Duration) ([]string, error) {
 func (s *Store) Close() error {
 	return s.db.Close()
 }
+
+// JobStats holds aggregate job counts by status.
+type JobStats struct {
+	Pending   int
+	Running   int
+	Completed int
+	Failed    int
+}
+
+// GetJobStats returns aggregate job counts by status.
+func (s *Store) GetJobStats() (*JobStats, error) {
+	stats := &JobStats{}
+	rows, err := s.db.Query(`SELECT status, COUNT(*) FROM jobs GROUP BY status`)
+	if err != nil {
+		return stats, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var status string
+		var count int
+		if err := rows.Scan(&status, &count); err != nil {
+			continue
+		}
+		switch models.JobStatus(status) {
+		case models.StatusPending:
+			stats.Pending = count
+		case models.StatusRunning:
+			stats.Running = count
+		case models.StatusCompleted:
+			stats.Completed = count
+		case models.StatusFailed, models.StatusTimeout:
+			stats.Failed += count
+		}
+	}
+	return stats, nil
+}

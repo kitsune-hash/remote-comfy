@@ -84,6 +84,9 @@ func main() {
 
 		// Worker connects here to relay progress
 		r.GET("/api/worker/connect/:id", interceptHandler.HandleWorkerConnect)
+
+		// Status endpoint — workers health + job stats
+		r.GET("/api/status", interceptHandler.HandleStatus)
 	} else if proxyHandler != nil {
 		// === DIRECT PROXY MODE (legacy) ===
 		r.GET("/ws", proxyHandler.ProxyWS)
