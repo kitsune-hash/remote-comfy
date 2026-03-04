@@ -87,6 +87,21 @@ func main() {
 
 		// Status endpoint — workers health + job stats
 		r.GET("/api/status", interceptHandler.HandleStatus)
+
+		// Worker cache update
+		r.POST("/api/worker/cache", interceptHandler.HandleWorkerCacheUpdate)
+
+		// Cached ComfyUI endpoints (no proxy needed)
+		r.GET("/object_info", interceptHandler.HandleCachedEndpoint)
+		r.GET("/object_info/:node", interceptHandler.HandleCachedEndpoint)
+		r.GET("/api/object_info", interceptHandler.HandleCachedEndpoint)
+		r.GET("/api/object_info/:node", interceptHandler.HandleCachedEndpoint)
+		r.GET("/system_stats", interceptHandler.HandleCachedEndpoint)
+		r.GET("/api/system_stats", interceptHandler.HandleCachedEndpoint)
+		r.GET("/embeddings", interceptHandler.HandleCachedEndpoint)
+		r.GET("/api/embeddings", interceptHandler.HandleCachedEndpoint)
+		r.GET("/extensions", interceptHandler.HandleCachedEndpoint)
+		r.GET("/api/extensions", interceptHandler.HandleCachedEndpoint)
 	} else if proxyHandler != nil {
 		// === DIRECT PROXY MODE (legacy) ===
 		r.GET("/ws", proxyHandler.ProxyWS)

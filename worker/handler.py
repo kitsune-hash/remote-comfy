@@ -21,6 +21,9 @@ sys.stderr = open(sys.stderr.fileno(), mode='w', buffering=1)
 # Config from environment
 COMFY_URL = os.environ.get("COMFY_URL", "http://127.0.0.1:8188")
 
+# Gateway config
+GATEWAY_URL = os.environ.get("GATEWAY_URL", "")
+
 # Azure Blob Storage config
 AZURE_STORAGE_CONNECTION_STRING = os.environ.get("AZURE_STORAGE_CONNECTION_STRING", "")
 AZURE_CONTAINER = os.environ.get("AZURE_CONTAINER", "ephemeral")
@@ -215,6 +218,31 @@ def execute_workflow(task_id, payload):
     return error, {"output_urls": output_urls, "duration_ms": duration_ms} if not error else None
 
 
+def push_cache_to_gateway():
+    """Send ComfyUI endpoint data to gateway cache."""
+    if not GATEWAY_URL:
+        log("[handler] No GATEWAY_URL set, skipping cache push")
+        return
+
+    endpoints = ["/object_info", "/system_stats", "/embeddings", "/extensions"]
+    for endpoint in endpoints:
+        try:
+            r = requests.get(f"{COMFY_URL}{endpoint}", timeout=30)
+            if r.status_code == 200:
+                data = r.json()
+                resp = requests.post(
+                    f"{GATEWAY_URL}/api/worker/cache",
+                    json={"endpoint": endpoint, "data": data},
+                    timeout=30
+                )
+                if resp.status_code == 200:
+                    log(f"[handler] Cached {endpoint} ({len(r.content)} bytes)")
+                else:
+                    log(f"[handler] Cache push failed for {endpoint}: {resp.status_code}")
+        except Exception as e:
+            log(f"[handler] Cache push error for {endpoint}: {e}")
+
+
 def main():
     log(f"[handler] Starting remote-comfy handler")
     log(f"[handler] ComfyUI: {COMFY_URL}")
@@ -233,6 +261,9 @@ def main():
             print(json.dumps({"status": "error", "error": "ComfyUI not available"}), flush=True)
             sys.exit(1)
         time.sleep(2)
+
+    # Push ComfyUI data to gateway cache
+    push_cache_to_gateway()
 
     # Signal ready to runqy-worker
     print(json.dumps({"status": "ready"}), flush=True)

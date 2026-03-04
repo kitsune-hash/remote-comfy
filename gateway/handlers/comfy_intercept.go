@@ -472,3 +472,55 @@ func (h *ComfyInterceptHandler) HandleStatus(c *gin.Context) {
 		"runqy_server": workersOK,
 	})
 }
+
+// Cached ComfyUI data (populated by worker on connect)
+type ComfyCache struct {
+	mu   sync.RWMutex
+	data map[string]json.RawMessage // path → response body
+}
+
+var comfyCache = &ComfyCache{
+	data: make(map[string]json.RawMessage),
+}
+
+func (c *ComfyCache) Set(key string, value json.RawMessage) {
+	c.mu.Lock()
+	c.data[key] = value
+	c.mu.Unlock()
+	log.Printf("[cache] Cached %s (%d bytes)", key, len(value))
+}
+
+func (c *ComfyCache) Get(key string) (json.RawMessage, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	v, ok := c.data[key]
+	return v, ok
+}
+
+// HandleCachedEndpoint serves cached ComfyUI responses or returns 503 if not yet available.
+func (h *ComfyInterceptHandler) HandleCachedEndpoint(c *gin.Context) {
+	path := c.Request.URL.Path
+	// Normalize: /api/object_info and /object_info both map to /object_info
+	path = strings.TrimPrefix(path, "/api")
+
+	if data, ok := comfyCache.Get(path); ok {
+		c.Header("Content-Type", "application/json")
+		c.Writer.Write(data)
+		return
+	}
+	c.JSON(503, gin.H{"error": "worker not connected yet, data not available"})
+}
+
+// HandleWorkerCacheUpdate receives cached endpoint data from worker via POST /api/worker/cache
+func (h *ComfyInterceptHandler) HandleWorkerCacheUpdate(c *gin.Context) {
+	var payload struct {
+		Endpoint string          `json:"endpoint"`
+		Data     json.RawMessage `json:"data"`
+	}
+	if err := c.ShouldBindJSON(&payload); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+	comfyCache.Set(payload.Endpoint, payload.Data)
+	c.JSON(200, gin.H{"ok": true})
+}
