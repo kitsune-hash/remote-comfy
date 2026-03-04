@@ -1,68 +1,47 @@
-FROM pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime
+# Remote-Comfy Worker
+# ComfyUI + runqy-worker + handler in one image
+#
+# Build: docker build -t remote-comfy-worker .
+# Run:   docker run --gpus all -e RUNQY_URL=... -e RUNQY_API_KEY=... remote-comfy-worker
+
+FROM pytorch/pytorch:2.6.0-cuda12.6-cudnn9-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV COMFY_URL=http://127.0.0.1:8188
+ENV AZURE_CONTAINER=ephemeral
 
-# System dependencies
-RUN apt-get update && apt-get install -y \
-    git \
-    wget \
-    curl \
-    libgl1-mesa-glx \
-    libglib2.0-0 \
+WORKDIR /workspace
+
+# System deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git curl wget \
+    libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install runqy-worker binary
-RUN curl -fsSL https://github.com/Publikey/runqy-worker/releases/latest/download/runqy-worker-linux-amd64 \
-    -o /usr/local/bin/runqy-worker && \
-    chmod +x /usr/local/bin/runqy-worker
-
-# Clone ComfyUI
-RUN git clone https://github.com/comfyanonymous/ComfyUI.git /comfy
-WORKDIR /comfy
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Install ComfyUI-Manager
-RUN cd custom_nodes && \
-    git clone https://github.com/ltdrdata/ComfyUI-Manager.git
-
-# Install popular custom nodes
-RUN cd custom_nodes && \
-    git clone https://github.com/cubiq/ComfyUI_IPAdapter_plus && \
-    git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite && \
-    git clone https://github.com/Fannovel16/comfyui_controlnet_aux && \
-    git clone https://github.com/ltdrdata/ComfyUI-Impact-Pack && \
-    git clone https://github.com/pythongosssss/ComfyUI-Custom-Scripts && \
-    git clone https://github.com/jags111/efficiency-nodes-comfyui && \
-    git clone https://github.com/WASasquatch/was-node-suite-comfyui && \
-    git clone https://github.com/Suzie1/ComfyUI_Comfyroll_CustomNodes && \
-    git clone https://github.com/rgthree/rgthree-comfy && \
-    git clone https://github.com/kijai/ComfyUI-KJNodes
-
-# Install custom node dependencies
-RUN for dir in custom_nodes/*/; do \
-    if [ -f "$dir/requirements.txt" ]; then \
-        pip install --no-cache-dir -r "$dir/requirements.txt" 2>/dev/null || true; \
-    fi; \
-    done
+# Install ComfyUI
+RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git /workspace/ComfyUI \
+    && cd /workspace/ComfyUI \
+    && pip install --no-cache-dir -r requirements.txt
 
 # Handler dependencies
-COPY requirements.txt /worker/requirements.txt
-RUN pip install --no-cache-dir -r /worker/requirements.txt
+COPY requirements.txt /workspace/handler/requirements.txt
+RUN pip install --no-cache-dir -r /workspace/handler/requirements.txt
 
-# Handler script (called by runqy-worker)
-COPY handler.py /worker/handler.py
-RUN chmod +x /worker/handler.py
+# Install runqy-worker binary
+RUN curl -sL https://github.com/Publikey/runqy-worker/releases/download/v0.2.5/runqy-worker_0.2.5_linux_amd64.tar.gz \
+    | tar -xz -C /usr/local/bin/ runqy-worker \
+    && chmod +x /usr/local/bin/runqy-worker
 
-# Model directory (mount or download at boot)
-RUN mkdir -p /comfy/models/checkpoints /comfy/models/loras /comfy/models/vae
+# Copy handler code
+COPY handler.py /workspace/handler/handler.py
 
-# Runqy worker config
-COPY worker-config.toml /etc/runqy-worker/config.toml
+# Worker config
+COPY config.yml /workspace/handler/config.yml
 
-ENV COMFY_DIR=/comfy
-ENV COMFY_URL=http://127.0.0.1:8188
-ENV PYTHONUNBUFFERED=1
+# Startup script
+COPY entrypoint.sh /workspace/entrypoint.sh
+RUN chmod +x /workspace/entrypoint.sh
 
-# runqy-worker is the entrypoint, it handles job pulling and calls our handler
-ENTRYPOINT ["runqy-worker"]
-CMD ["--config", "/etc/runqy-worker/config.toml"]
+EXPOSE 8188
+
+ENTRYPOINT ["/workspace/entrypoint.sh"]

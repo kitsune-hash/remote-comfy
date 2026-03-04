@@ -1,0 +1,4 @@
+__pycache__
+*.pyc
+.venv
+simple_worker.py.bak

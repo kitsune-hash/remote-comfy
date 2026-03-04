@@ -5,10 +5,3 @@ server:
 worker:
   queue: "comfy"
   concurrency: 1
-  handler:
-    command: "python3 /workspace/handler.py"
-    mode: "long_running"
-  timeouts:
-    job: "20m"
-    graceful_shutdown: "30s"
-  heartbeat_interval: "30s"
