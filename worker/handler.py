@@ -1,274 +1,273 @@
 #!/usr/bin/env python3
 """
-remote-comfy handler — Called by runqy-worker for each job.
-Executes ComfyUI workflow and relays progress to gateway.
+Remote-Comfy Handler for runqy-worker (stdio protocol).
 
-Input: JSON payload on stdin (from runqy-worker)
-Output: JSON result on stdout (to runqy-worker)
-
-Environment (injected by runqy-worker from vault):
-    AZURE_STORAGE_CONNECTION_STRING
-    GATEWAY_URL
+Receives jobs via stdin JSON lines, executes workflows on local ComfyUI,
+relays progress to the gateway via WebSocket, returns results via stdout.
 """
 
-import json
 import os
-import subprocess
 import sys
+import json
 import time
 import uuid
-from pathlib import Path
-
-import requests
 import websocket
-from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
-from datetime import datetime, timedelta, timezone
+import requests
 
-# Config
-COMFY_URL = os.getenv("COMFY_URL", "http://127.0.0.1:8188")
-COMFY_DIR = os.getenv("COMFY_DIR", "/comfy")
-AZURE_CONN_STR = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
-AZURE_CONTAINER = os.getenv("AZURE_CONTAINER", "outputs")
+# Force unbuffered output for stdio protocol
+sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1)
+sys.stderr = open(sys.stderr.fileno(), mode='w', buffering=1)
 
-# Global ComfyUI process
-comfy_process = None
+# Config from environment
+COMFY_URL = os.environ.get("COMFY_URL", "http://127.0.0.1:8188")
+
+# Azure Blob Storage config
+AZURE_STORAGE_CONNECTION_STRING = os.environ.get("AZURE_STORAGE_CONNECTION_STRING", "")
+AZURE_CONTAINER = os.environ.get("AZURE_CONTAINER", "ephemeral")
+AZURE_CDN_URL = os.environ.get("AZURE_CDN_URL", "https://storagesdxldev.blob.core.windows.net")
 
 
 def log(msg):
-    print(f"[handler] {msg}", file=sys.stderr)
+    """Log to stderr (stdout is reserved for protocol)."""
+    print(msg, file=sys.stderr, flush=True)
 
 
-def start_comfy():
-    """Start ComfyUI headless server if not running."""
-    global comfy_process
-    
-    # Check if already running
+def respond(task_id, result=None, error=None, retry=False):
+    """Send response to runqy-worker via stdout."""
+    resp = {"task_id": task_id}
+    if error:
+        resp["error"] = error
+        if retry:
+            resp["retry"] = True
+    elif result:
+        resp["result"] = result
+    print(json.dumps(resp), flush=True)
+
+
+def upload_to_azure(image_data, filename, job_id):
+    """Upload image to Azure Blob Storage and return public URL."""
+    if not AZURE_STORAGE_CONNECTION_STRING:
+        return None
     try:
-        resp = requests.get(f"{COMFY_URL}/system_stats", timeout=2)
-        if resp.status_code == 200:
-            log("ComfyUI already running")
-            return True
-    except:
-        pass
-    
-    log(f"Starting ComfyUI from {COMFY_DIR}...")
-    comfy_process = subprocess.Popen(
-        [sys.executable, "main.py", "--listen", "127.0.0.1", "--port", "8188", "--preview-method", "auto"],
-        cwd=COMFY_DIR,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-    )
-    
-    # Wait for ready (2 min timeout)
-    for i in range(120):
-        try:
-            resp = requests.get(f"{COMFY_URL}/system_stats", timeout=2)
-            if resp.status_code == 200:
-                log("ComfyUI is ready!")
-                return True
-        except:
-            pass
-        time.sleep(1)
-    
-    raise RuntimeError("ComfyUI failed to start within 2 minutes")
-
-
-def upload_to_azure(file_path: str, job_id: str) -> str:
-    """Upload file to Azure Blob, return pre-signed URL."""
-    if not AZURE_CONN_STR:
-        log("No Azure connection string, returning local path")
-        return f"file://{file_path}"
-    
-    blob_service = BlobServiceClient.from_connection_string(AZURE_CONN_STR)
-    container_client = blob_service.get_container_client(AZURE_CONTAINER)
-    
-    try:
-        container_client.create_container()
-    except:
-        pass
-    
-    blob_name = f"{job_id}/{Path(file_path).name}"
-    blob_client = container_client.get_blob_client(blob_name)
-    
-    with open(file_path, "rb") as f:
-        blob_client.upload_blob(f, overwrite=True)
-    
-    sas_token = generate_blob_sas(
-        account_name=blob_service.account_name,
-        container_name=AZURE_CONTAINER,
-        blob_name=blob_name,
-        account_key=blob_service.credential.account_key,
-        permission=BlobSasPermissions(read=True),
-        expiry=datetime.now(timezone.utc) + timedelta(hours=24),
-    )
-    
-    return f"{blob_client.url}?{sas_token}"
-
-
-def execute_workflow(job_id: str, workflow: dict, gateway_url: str) -> dict:
-    """Execute workflow, relay progress, return results."""
-    start_time = time.time()
-    output_urls = []
-    
-    # Connect to gateway WebSocket for progress relay
-    gateway_ws_url = gateway_url.replace("http://", "ws://").replace("https://", "wss://")
-    gateway_ws_url = f"{gateway_ws_url}/api/worker/connect/{job_id}"
-    
-    gw_ws = None
-    try:
-        gw_ws = websocket.create_connection(gateway_ws_url, timeout=10)
-        log(f"Connected to gateway WS")
-    except Exception as e:
-        log(f"Failed to connect to gateway WS: {e}")
-        # Continue anyway, results will still be uploaded
-    
-    try:
-        # Submit workflow to ComfyUI
-        client_id = str(uuid.uuid4())
-        prompt_data = {"prompt": workflow, "client_id": client_id}
-        
-        resp = requests.post(f"{COMFY_URL}/prompt", json=prompt_data, timeout=10)
-        if resp.status_code != 200:
-            raise RuntimeError(f"ComfyUI rejected workflow: {resp.text}")
-        
-        prompt_id = resp.json().get("prompt_id")
-        log(f"Workflow submitted, prompt_id: {prompt_id}")
-        
-        # Connect to ComfyUI WebSocket for progress
-        comfy_ws = websocket.create_connection(
-            f"{COMFY_URL.replace('http', 'ws')}/ws?clientId={client_id}",
-            timeout=5,
+        from azure.storage.blob import BlobServiceClient, ContentSettings
+        blob_service = BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
+        container_client = blob_service.get_container_client(AZURE_CONTAINER)
+        blob_name = f"remote-comfy/{job_id}/{filename}"
+        blob_client = container_client.get_blob_client(blob_name)
+        blob_client.upload_blob(
+            image_data, overwrite=True,
+            content_settings=ContentSettings(content_type="image/png")
         )
-        
-        # Relay progress events
-        completed = False
-        while not completed:
+        url = f"{AZURE_CDN_URL}/{AZURE_CONTAINER}/{blob_name}"
+        log(f"[handler] Uploaded to Azure: {url}")
+        return url
+    except Exception as e:
+        log(f"[handler] Azure upload failed: {e}")
+        return None
+
+
+def download_comfy_image(filename, subfolder=""):
+    """Download image from ComfyUI."""
+    params = {"filename": filename}
+    if subfolder:
+        params["subfolder"] = subfolder
+    response = requests.get(f"{COMFY_URL}/view", params=params, timeout=30)
+    response.raise_for_status()
+    return response.content
+
+
+def execute_workflow(task_id, payload):
+    """Execute a ComfyUI workflow and relay progress to gateway."""
+    job_id = payload.get("job_id")
+    workflow = payload.get("workflow")
+    gateway_url = payload.get("gateway_url", "")
+
+    log(f"[handler] Executing job {job_id}")
+
+    gateway_ws = None
+    comfy_ws = None
+    outputs = []
+    error = None
+    start_time = time.time()
+
+    try:
+        # Connect to gateway WebSocket for progress relay
+        if gateway_url:
+            ws_url = gateway_url.replace("http://", "ws://").replace("https://", "wss://")
+            ws_url = f"{ws_url}/api/worker/connect/{job_id}"
+            log(f"[handler] Connecting to gateway: {ws_url}")
+            gateway_ws = websocket.create_connection(ws_url, timeout=30)
+            log(f"[handler] Connected to gateway")
+
+        # Connect to ComfyUI WebSocket for progress
+        client_id = str(uuid.uuid4())
+        comfy_ws_url = COMFY_URL.replace("http://", "ws://") + f"/ws?clientId={client_id}"
+        comfy_ws = websocket.create_connection(comfy_ws_url, timeout=10)
+        log(f"[handler] Connected to ComfyUI (client_id: {client_id})")
+
+        # Submit workflow to ComfyUI
+        prompt_response = requests.post(
+            f"{COMFY_URL}/prompt",
+            json={"prompt": workflow, "client_id": client_id},
+            timeout=30
+        )
+        prompt_response.raise_for_status()
+        prompt_id = prompt_response.json().get("prompt_id")
+        log(f"[handler] Submitted workflow, prompt_id: {prompt_id}")
+
+        # Relay progress messages
+        while True:
             try:
-                result = comfy_ws.recv()
-                if isinstance(result, str):
-                    msg = json.loads(result)
-                    msg_type = msg.get("type", "")
-                    
-                    # Relay to gateway
-                    if gw_ws:
-                        try:
-                            gw_ws.send(result)
-                        except:
-                            pass
-                    
-                    # Check for completion
-                    if msg_type == "executing" and msg.get("data", {}).get("node") is None:
-                        completed = True
+                comfy_ws.settimeout(120)
+                msg = comfy_ws.recv()
+
+                # Forward binary messages (preview images) as-is
+                if isinstance(msg, bytes):
+                    if gateway_ws:
+                        gateway_ws.send(msg, opcode=websocket.ABNF.OPCODE_BINARY)
+                    continue
+
+                data = json.loads(msg)
+                msg_type = data.get("type")
+
+                if msg_type in ("executing", "executed", "execution_error", "execution_cached"):
+                    log(f"[handler] ComfyUI: {msg_type} - {data.get('data', {})}")
+
+                # Forward to gateway
+                if gateway_ws:
+                    gateway_ws.send(msg)
+
+                if msg_type == "executing":
+                    node = data.get("data", {}).get("node")
+                    if node is None:
+                        log(f"[handler] Execution complete")
+                        break
+                elif msg_type == "executed":
+                    output_data = data.get("data", {}).get("output", {})
+                    images = output_data.get("images", [])
+                    for img in images:
+                        filename = img.get("filename")
+                        subfolder = img.get("subfolder", "")
+                        if filename:
+                            outputs.append({"filename": filename, "subfolder": subfolder})
+                            # Upload to Azure immediately
+                            try:
+                                image_data = download_comfy_image(filename, subfolder)
+                                azure_url = upload_to_azure(image_data, filename, job_id)
+                                if azure_url and gateway_ws:
+                                    gateway_ws.send(json.dumps({
+                                        "type": "image_uploaded",
+                                        "filename": filename,
+                                        "subfolder": subfolder,
+                                        "azure_url": azure_url
+                                    }))
+                            except Exception as e:
+                                log(f"[handler] Early upload failed for {filename}: {e}")
+                elif msg_type == "execution_error":
+                    error = data.get("data", {}).get("exception_message", "Unknown error")
+                    log(f"[handler] Execution error: {error}")
+                    break
+
             except websocket.WebSocketTimeoutException:
-                continue
-            except Exception as e:
-                log(f"ComfyUI WS error: {e}")
+                error = "ComfyUI execution timeout"
                 break
-        
-        comfy_ws.close()
-        
-        # Fetch outputs from ComfyUI history
-        try:
-            hist_resp = requests.get(f"{COMFY_URL}/history/{prompt_id}", timeout=10)
-            if hist_resp.status_code == 200:
-                history = hist_resp.json()
-                outputs = history.get(prompt_id, {}).get("outputs", {})
-                
-                for node_id, node_output in outputs.items():
-                    if "images" in node_output:
-                        for img in node_output["images"]:
-                            filename = img["filename"]
-                            subfolder = img.get("subfolder", "")
-                            img_type = img.get("type", "output")
-                            
-                            # Download from ComfyUI
-                            img_resp = requests.get(
-                                f"{COMFY_URL}/view",
-                                params={"filename": filename, "subfolder": subfolder, "type": img_type},
-                                timeout=30,
-                            )
-                            if img_resp.status_code == 200:
-                                local_path = f"/tmp/{job_id}_{filename}"
-                                with open(local_path, "wb") as f:
-                                    f.write(img_resp.content)
-                                
-                                url = upload_to_azure(local_path, job_id)
-                                output_urls.append(url)
-                                os.remove(local_path)
-        except Exception as e:
-            log(f"Failed to fetch outputs: {e}")
-        
+            except Exception as e:
+                error = str(e)
+                break
+
+        # Collect output URLs
         duration_ms = int((time.time() - start_time) * 1000)
-        
-        # Send completion to gateway
-        if gw_ws:
-            try:
-                gw_ws.send(json.dumps({
+        output_urls = []
+        for img_info in outputs:
+            filename = img_info["filename"]
+            if AZURE_STORAGE_CONNECTION_STRING:
+                output_urls.append(f"{AZURE_CDN_URL}/{AZURE_CONTAINER}/remote-comfy/{job_id}/{filename}")
+            else:
+                output_urls.append(f"{COMFY_URL}/view?filename={filename}")
+
+        # Send completion/error to gateway
+        if gateway_ws:
+            if error:
+                gateway_ws.send(json.dumps({"type": "error", "error": error}))
+            else:
+                gateway_ws.send(json.dumps({
                     "type": "completed",
                     "output_urls": output_urls,
-                    "duration_ms": duration_ms,
+                    "duration_ms": duration_ms
                 }))
-            except:
-                pass
-        
-        log(f"Completed in {duration_ms}ms, {len(output_urls)} outputs")
-        
-        return {
-            "success": True,
-            "output_urls": output_urls,
-            "duration_ms": duration_ms,
-        }
-        
+                log(f"[handler] Sent completion: {len(output_urls)} outputs, {duration_ms}ms")
+            time.sleep(0.5)
+
     except Exception as e:
-        log(f"Failed: {e}")
-        if gw_ws:
+        error = str(e)
+        log(f"[handler] Job failed: {e}")
+        if gateway_ws:
             try:
-                gw_ws.send(json.dumps({"type": "error", "error": str(e)}))
+                gateway_ws.send(json.dumps({"type": "error", "error": error}))
             except:
                 pass
-        return {
-            "success": False,
-            "error": str(e),
-        }
     finally:
-        if gw_ws:
-            gw_ws.close()
+        if comfy_ws:
+            comfy_ws.close()
+        if gateway_ws:
+            gateway_ws.close()
+
+    return error, {"output_urls": output_urls, "duration_ms": duration_ms} if not error else None
 
 
 def main():
-    # Read job payload from stdin (passed by runqy-worker)
-    input_data = sys.stdin.read()
-    
-    try:
-        payload = json.loads(input_data)
-    except json.JSONDecodeError as e:
-        print(json.dumps({"success": False, "error": f"Invalid JSON input: {e}"}))
-        sys.exit(1)
-    
-    job_id = payload.get("job_id", str(uuid.uuid4()))
-    workflow = payload.get("workflow")
-    gateway_url = payload.get("gateway_url", os.getenv("GATEWAY_URL", "http://localhost:8080"))
-    
-    if not workflow:
-        print(json.dumps({"success": False, "error": "No workflow provided"}))
-        sys.exit(1)
-    
-    log(f"Processing job {job_id}")
-    
-    # Ensure ComfyUI is running
-    try:
-        start_comfy()
-    except Exception as e:
-        print(json.dumps({"success": False, "error": f"Failed to start ComfyUI: {e}"}))
-        sys.exit(1)
-    
-    # Execute workflow
-    result = execute_workflow(job_id, workflow, gateway_url)
-    
-    # Output result to stdout (for runqy-worker)
-    print(json.dumps(result))
-    
-    sys.exit(0 if result.get("success") else 1)
+    log(f"[handler] Starting remote-comfy handler")
+    log(f"[handler] ComfyUI: {COMFY_URL}")
+    log(f"[handler] Azure: {AZURE_CONTAINER}@{AZURE_CDN_URL.split('/')[-1] if AZURE_CDN_URL else 'disabled'}")
+
+    # Wait for ComfyUI to be ready
+    for i in range(30):
+        try:
+            r = requests.get(f"{COMFY_URL}/system_stats", timeout=5)
+            if r.status_code == 200:
+                log(f"[handler] ComfyUI ready")
+                break
+        except:
+            pass
+        if i == 29:
+            print(json.dumps({"status": "error", "error": "ComfyUI not available"}), flush=True)
+            sys.exit(1)
+        time.sleep(2)
+
+    # Signal ready to runqy-worker
+    print(json.dumps({"status": "ready"}), flush=True)
+    log(f"[handler] Ready, waiting for tasks...")
+
+    # Read tasks from stdin (JSON lines)
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+
+        try:
+            task = json.loads(line)
+        except json.JSONDecodeError as e:
+            log(f"[handler] Invalid JSON: {e}")
+            continue
+
+        task_id = task.get("task_id", "")
+        payload = task.get("payload", {})
+
+        # payload might be a string (double-encoded)
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except:
+                pass
+
+        log(f"[handler] Received task {task_id}: job={payload.get('job_id', '?')}")
+
+        error, result = execute_workflow(task_id, payload)
+
+        if error:
+            respond(task_id, error=error)
+        else:
+            respond(task_id, result=result)
 
 
 if __name__ == "__main__":
