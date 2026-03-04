@@ -223,8 +223,20 @@ def execute_workflow(job):
                         filename = img.get("filename")
                         subfolder = img.get("subfolder", "")
                         if filename:
-                            # Store for later upload (after sending WS messages)
                             outputs.append({"filename": filename, "subfolder": subfolder})
+                            # Upload to Azure immediately so gateway can serve it
+                            try:
+                                image_data = download_comfy_image(filename, subfolder)
+                                azure_url = upload_to_azure(image_data, filename, job_id)
+                                if azure_url:
+                                    gateway_ws.send(json.dumps({
+                                        "type": "image_uploaded",
+                                        "filename": filename,
+                                        "subfolder": subfolder,
+                                        "azure_url": azure_url
+                                    }))
+                            except Exception as e:
+                                print(f"[worker] Early upload failed for {filename}: {e}")
                 elif msg_type == "execution_error":
                     error = data.get("data", {}).get("exception_message", "Unknown error")
                     print(f"[worker] Execution error: {error}")
@@ -239,20 +251,16 @@ def execute_workflow(job):
                 error = str(e)
                 break
         
-        # Upload outputs to Azure (do this after ComfyUI is done, but before sending completion)
+        # Collect output URLs (images already uploaded during execution)
         output_urls = []
         for img_info in outputs:
             filename = img_info["filename"]
             subfolder = img_info.get("subfolder", "")
-            try:
-                image_data = download_comfy_image(filename, subfolder)
-                azure_url = upload_to_azure(image_data, filename, job_id)
-                if azure_url:
-                    output_urls.append(azure_url)
-                else:
-                    output_urls.append(f"{COMFY_URL}/view?filename={filename}&subfolder={subfolder}")
-            except Exception as e:
-                print(f"[worker] Failed to upload {filename}: {e}")
+            # Construct Azure URL (already uploaded during executed handler)
+            if AZURE_STORAGE_CONNECTION_STRING:
+                url = f"{AZURE_CDN_URL}/{AZURE_CONTAINER}/remote-comfy/{job_id}/{filename}"
+                output_urls.append(url)
+            else:
                 output_urls.append(f"{COMFY_URL}/view?filename={filename}&subfolder={subfolder}")
         
         duration_ms = int((time.time() - start_time) * 1000)

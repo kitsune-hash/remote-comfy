@@ -20,6 +20,7 @@ func main() {
 	dbPath := getEnv("DB_PATH", "./data/remote-comfy.db")
 	comfyURL := getEnv("COMFY_URL", "")
 	jobTimeout := 20 * time.Minute
+	routeViaRunqy := getEnv("ROUTE_VIA_RUNQY", "") != ""
 
 	os.MkdirAll("./data", 0755)
 
@@ -32,6 +33,7 @@ func main() {
 
 	relayMgr := relay.NewManager()
 	wfHandler := handlers.NewWorkflowHandler(store, relayMgr)
+	interceptHandler := handlers.NewComfyInterceptHandler(store)
 
 	var proxyHandler *handlers.ProxyHandler
 	if comfyURL != "" {
@@ -44,24 +46,57 @@ func main() {
 	r.Use(cors.New(cors.Config{
 		AllowAllOrigins:  true,
 		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"},
-		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization"},
+		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization", "Comfy-User"},
 		AllowWebSockets:  true,
 		MaxAge:           12 * time.Hour,
 	}))
 
-	// WebSocket proxy
-	if proxyHandler != nil {
+	if routeViaRunqy {
+		// === RUNQY ROUTING MODE ===
+		// Intercept /prompt and /ws — route execution through Runqy queue
+		log.Println("Runqy routing mode ENABLED")
+
+		// Intercept prompt submission
+		r.POST("/prompt", interceptHandler.HandlePrompt)
+		r.POST("/api/prompt", interceptHandler.HandlePrompt)
+
+		// Managed WebSocket (not proxied)
+		r.GET("/ws", interceptHandler.HandleWS)
+
+		// Image view — try Azure first, then proxy fallback
+		r.GET("/view", func(c *gin.Context) {
+			interceptHandler.HandleView(c)
+			if _, exists := c.Get("fallthrough"); exists && proxyHandler != nil {
+				log.Printf("[proxy] GET /view (Azure miss, proxying)")
+				proxyHandler.ProxyHTTP(c)
+			}
+		})
+		r.GET("/api/view", func(c *gin.Context) {
+			interceptHandler.HandleView(c)
+			if _, exists := c.Get("fallthrough"); exists && proxyHandler != nil {
+				log.Printf("[proxy] GET /api/view (Azure miss, proxying)")
+				proxyHandler.ProxyHTTP(c)
+			}
+		})
+		// Queue status
+		r.POST("/queue", interceptHandler.HandleQueue)
+		r.GET("/queue", interceptHandler.HandleQueue)
+
+		// Worker connects here to relay progress
+		r.GET("/api/worker/connect/:id", interceptHandler.HandleWorkerConnect)
+	} else if proxyHandler != nil {
+		// === DIRECT PROXY MODE (legacy) ===
 		r.GET("/ws", proxyHandler.ProxyWS)
 	}
 
-	// Our custom API routes
+	// Our custom API routes (always available)
 	api := r.Group("/api")
 	{
 		api.GET("/health", func(c *gin.Context) {
 			c.JSON(200, gin.H{
 				"status":  "ok",
 				"service": "remote-comfy-gateway",
-				"version": "0.1.0",
+				"version": "0.2.0",
 			})
 		})
 
@@ -73,16 +108,23 @@ func main() {
 			wf.GET("/stream/:id", wfHandler.Stream)
 		}
 
-		api.GET("/worker/connect/:id", wfHandler.WorkerConnect)
+		if !routeViaRunqy {
+			api.GET("/worker/connect/:id", wfHandler.WorkerConnect)
+		}
 	}
 
-	// Catch-all: proxy everything else to ComfyUI
+	// Catch-all: proxy everything else to ComfyUI (object_info, system_stats, view, etc.)
 	if proxyHandler != nil {
 		r.NoRoute(func(c *gin.Context) {
 			path := c.Request.URL.Path
 			if strings.HasPrefix(path, "/api/workflow") ||
 				strings.HasPrefix(path, "/api/worker") ||
 				path == "/api/health" {
+				c.JSON(404, gin.H{"error": "not found"})
+				return
+			}
+			// In Runqy mode, don't proxy /prompt or /ws (already handled)
+			if routeViaRunqy && (path == "/prompt" || path == "/api/prompt" || path == "/ws") {
 				c.JSON(404, gin.H{"error": "not found"})
 				return
 			}
